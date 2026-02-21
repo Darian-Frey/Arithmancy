@@ -1,97 +1,45 @@
-#define CL_HPP_ENABLE_EXCEPTIONS
-#define CL_HPP_TARGET_OPENCL_VERSION 200
-#include <CL/opencl.hpp>
-#include <iostream>
-#include <fstream>
-#include <vector>
-#include <string>
-#include <iterator>
-#include <sys/stat.h>
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
 
-const std::string VERSION = "1.2.0-INTEL";
-const std::string CODENAME = "Arithmancy";
+#define M_PI 3.14159265358979323846
+#define LIMB_BITS 18
+#define LIMB_MASK 0x3FFFF // (1 << 18) - 1
 
-bool file_exists(const std::string& name) {
-    struct stat buffer;   
-    return (stat(name.c_str(), &buffer) == 0); 
+/* Phase 1: Pointwise Squaring (18-bit Precision Protected) */
+__kernel void dwt_squaring(__global double* limbs) {
+    int gid = get_global_id(0);
+    int total_size = get_global_size(0);
+    
+    // Architect 01: 18-bit limbs fit safely in 53-bit mantissa
+    double val = limbs[gid];
+    double res = val * val; // Squaring in the frequency domain
+
+    limbs[gid] = res;
 }
 
-void save_checkpoint(cl::CommandQueue& queue, cl::Buffer& buffer, size_t size, int iteration) {
-    std::vector<double> host_data(size / sizeof(double));
-    queue.enqueueReadBuffer(buffer, CL_TRUE, 0, size, host_data.data());
-    mkdir("checkpoints", 0777);
-    std::ofstream ofs("checkpoints/m80m_latest.bin", std::ios::binary);
-    if (ofs.is_open()) {
-        ofs.write(reinterpret_cast<char*>(host_data.data()), size);
-        ofs.close();
-        std::cout << " [SAVE]   Checkpoint iteration " << iteration << " (Verified)" << std::endl;
-    }
-}
+/* Phase 2: Hierarchical Ripple Carry (Architect 02 & 04 Alignment) */
+/* This is the 'Local' pass that stays under 1.0s to avoid Hangcheck */
+__kernel void local_carry(__global double* limbs, __global uint* group_carries) {
+    int lid = get_local_id(0);
+    int gid = get_global_id(0);
+    int group_id = get_group_id(0);
+    int wg_size = get_local_size(0);
 
-int main(int argc, char* argv[]) {
-    std::cout << "==================================================" << std::endl;
-    std::cout << " ὀρθός (ORTHOS) - " << CODENAME << " [" << VERSION << "]" << std::endl;
-    std::cout << "==================================================" << std::endl;
+    __local long local_l[64]; // Architect 02: local storage for ripple
+    local_l[lid] = (long)limbs[gid];
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-    try {
-        std::vector<cl::Platform> platforms;
-        cl::Platform::get(&platforms);
-        std::vector<cl::Device> devices;
-        platforms[0].getDevices(CL_DEVICE_TYPE_GPU, &devices);
-        cl::Device device = devices[0];
-        std::cout << " [DEVICE] " << device.getInfo<CL_DEVICE_NAME>() << std::endl;
-
-        cl::Context context(device);
-        cl::CommandQueue queue(context, device);
-
-        std::ifstream k_file("src/kernels.cl");
-        std::string source((std::istreambuf_iterator<char>(k_file)), std::istreambuf_iterator<char>());
-        cl::Program::Sources sources;
-        sources.push_back({source.c_str(), source.length()});
-        cl::Program program(context, sources);
-        program.build({device});
-
-        size_t p = 80281262;
-        size_t n_elements = ((p / 18 + 1024) + 15) / 16 * 16;
-        size_t buffer_size = n_elements * sizeof(double);
-
-        cl::Buffer buffer_limbs(context, CL_MEM_READ_WRITE, buffer_size);
-        cl::Buffer buffer_carries(context, CL_MEM_READ_WRITE, 4096 * sizeof(uint32_t));
-
-        if (file_exists("checkpoints/m80m_latest.bin")) {
-            std::cout << " [LOAD]   Resuming from checkpoint..." << std::endl;
-            std::vector<double> host_data(n_elements);
-            std::ifstream ifs("checkpoints/m80m_latest.bin", std::ios::binary);
-            ifs.read(reinterpret_cast<char*>(host_data.data()), buffer_size);
-            queue.enqueueWriteBuffer(buffer_limbs, CL_TRUE, 0, buffer_size, host_data.data());
+    // Intra-workgroup ripple carry
+    if (lid == 0) {
+        long c = 0;
+        for (int i = 0; i < wg_size; i++) {
+            long total = local_l[i] + c;
+            local_l[i] = total & LIMB_MASK;
+            c = total >> LIMB_BITS;
         }
-
-        cl::Kernel dwt_kernel(program, "dwt_squaring");
-        cl::Kernel carry_kernel(program, "parallel_carry");
-
-        std::cout << " [STATUS] Active Hunt: M" << p << "..." << std::endl;
-
-        for (int i = 0; i <= 1000000; ++i) {
-            dwt_kernel.setArg(0, buffer_limbs);
-            queue.enqueueNDRangeKernel(dwt_kernel, cl::NullRange, cl::NDRange(n_elements), cl::NDRange(16));
-
-            carry_kernel.setArg(0, buffer_limbs);
-            carry_kernel.setArg(1, buffer_carries);
-            carry_kernel.setArg(2, 16);
-            queue.enqueueNDRangeKernel(carry_kernel, cl::NullRange, cl::NDRange(n_elements), cl::NDRange(16));
-            
-            if (i % 5000 == 0 && i > 0) {
-                save_checkpoint(queue, buffer_limbs, buffer_size, i);
-            }
-        }
-        queue.finish();
-
-    } catch (const cl::Error& e) {
-        std::cerr << "ERR: OpenCL - " << e.what() << " (" << e.err() << ")" << std::endl;
-        return 1;
-    } catch (const std::exception& e) {
-        std::cerr << "ERR: System - " << e.what() << std::endl;
-        return 1;
+        // Store overflow for the next kernel pass (Architect 02 Strategy)
+        group_carries[group_id] = (uint)c;
     }
-    return 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    limbs[gid] = (double)local_l[lid];
 }
